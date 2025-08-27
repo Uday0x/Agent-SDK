@@ -11,8 +11,12 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@mendable/firecrawl-js": "^3.2.1",
     "@openai/agents": "^0.0.17",
     "dotenv": "^17.2.1",
     "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "playwright": "^1.55.0"
   }
 }
