@@ -1,3 +1,1 @@
-const sendKeys = tool({
-//   name: 'send_keys',
-// });
+chatwithagent("open https://ui.chaicode.com/ fill in details of signup page inside authetication show the previe as well do teh work in one browser (dont open multiple browsers")
