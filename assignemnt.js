@@ -148,7 +148,7 @@ const inputWriter = tool({
 });
 
 const clicker = tool({
-  name: "click_item",
+  name: "click_element",
   description: "Click element using fallback selectors",
   parameters: z.object({ selectors: z.array(z.string()) }),
   async execute({ selectors }) {
@@ -167,70 +167,40 @@ const clicker = tool({
 
 // ====== Agent Setup ======
 const webAgent = new Agent({
-  name:"automationagnet",
- instructions: `
-You are a **DOM-based website automation agent**.  
-Your job is to automate web interactions step by step using the provided tools.  
-Always inspect and rely on the DOM structure before performing any action.  
+  name: "automationagent",
+  instructions: `
+You are a **DOM-based website automation agent**.
+Your job is to navigate and interact with websites step by step using tools.
 
 ---
 
 ## Workflow Rules:
 
-1. **Start Browser**
-   - If no browser is open, always call \`open_browser\`.
+1. **Open Target URL**
+   - Always begin with \`open_url\`.
 
-2. **Open Target URL**
-   - Use \`open_url\` with the given website link.
-   - If \`waitFor\` is provided, wait that many milliseconds after navigation.
+2. **Inspect Page**
+   - Use \`page_structure("button")\` to detect navigation buttons like "Authentication" or "Signup".
+   - Click the correct button using \`click_element\`.
 
-3. **Inspect Page**
-   - Use \`page_strcucture\` to extract DOM details (forms, inputs, buttons).
-   - From the structure, generate multiple reliable CSS selectors for each target element.
-   - Selector priority order:
-     1. \`#id\`
-     2. \`[name="..."]\`
-     3. \`[placeholder*="..."]\`
-     4. \`input[type="..."]\`
-     5. \`.className\`
+3. **Move to Signup**
+   - After clicking, again run \`page_structure("form")\`.
+   - Collect form fields (first name, last name, email, password, confirm password).
 
-4. **Take Screenshot**
-   - After each major action (open page, fill input, click button), call \`take_screenshot\` to confirm progress.
+4. **Form Filling**
+   - Use \`fill_input\` with multiple selectors for each field.
+   - Fill values provided by the user.
 
-5. **Form Filling**
-   - For each input field:
-     - Gather multiple selector options from \`page_strcucture\`.
-     - Use \`fill_input\` with \`{ selectors: [...], value: "..." }\`.
-   - After filling, always confirm with \`take_screenshot\`.
+5. **Submit**
+   - Identify "Create Account" / "Sign Up" button using \`page_structure("button")\`.
+   - Use \`click_element\` on it.
 
-6. **Click Buttons / Links**
-   - For navigation or submission, use \`click_element\` with multiple selector options.
-   - If text is available, you may also use \`click_button_by_text\`.
+6. **After Each Step**
+   - Run \`take_screenshot\` to confirm progress.
 
-7. **Error Handling**
-   - If one selector fails, the tool will try the next.
-   - If all fail, re-run \`page_strcucture\` (DOM may have changed).
-
-8. **Completion**
-   - After final action (e.g., form submission), take a last screenshot.
-   - Then call \`close_browser\`.
-   - Provide a clear step-by-step action log as the final output.
-
----
-
-## Example Strategy:
-Task: "Go to signup page and fill form"
-
-1. \`open_browser\`
-2. \`open_url("https://ui.chaicode.com/", waitFor: 2000)\`
-3. \`page_strcucture("button")\` → find Authentication button
-4. \`click_element(["#authBtn", ".auth-btn", "button:has-text('Authentication')"])\`
-5. \`page_strcucture("form")\` → extract input fields
-6. \`fill_input({ selectors: ["#email", "[name='email']", "[placeholder*='email']"], value: "test@example.com" })\`
-7. \`fill_input({ selectors: ["#password", "[name='password']", "input[type='password']"], value: "password123" })\`
-8. \`click_element(["#signupBtn", ".btn-signup", "button:has-text('Sign Up')"])\`
-9. \`take_screenshot\`
-10. \`close_browser\`
+7. **Completion**
+   - After submission, final screenshot and then stop.
+   - Provide step-by-step log.
 `,
   tools: [screenshotTool, navigateTool, domExplorer, inputWriter, clicker],
   model: "gpt-4o-mini",
@@ -240,7 +210,7 @@ Task: "Go to signup page and fill form"
 async function talkToAgent(task) {
   const runner = new Runner({ modelProvider: provider });
   try {
-    const result = await runner.run(webAgent, task, { maxTurns: 20 });
+    const result = await runner.run(webAgent, task, { maxTurns: 25 });
     console.log("Final Log:", result.finalOutput);
     await browserInstance.close();
   } catch (err) {
@@ -249,15 +219,17 @@ async function talkToAgent(task) {
   }
 }
 
+// ====== EXECUTION ======
 talkToAgent(`
 Go to https://ui.chaicode.com
-and complete the signup form in authentication  with:
-- First: Uday Krishna,
-- Last: Uday,
-- Email: abc@gmail.com,
-- Password: 12345@Test,
-- Confirm Password: 12345@Test,
-Finally, press the "Create Account" button.
-
-plz fill in teh correct details dont hurry the process
+- On homepage, click the "Authentication" or "Signup" button.
+- Navigate to signup form.
+- Fill in:
+  - First Name: Uday Krishna
+  - Last Name: Uday
+  - Email: abc@gmail.com
+  - Password: 12345@Test
+  - Confirm Password: 12345@Test
+- Finally press the "Create Account" button.
+Make sure to take screenshot after each step.
 `);
