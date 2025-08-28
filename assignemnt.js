@@ -1,247 +1,263 @@
-import 'dotenv/config';
-import { Agent, run, tool } from "@openai/agents";
+import dotenv from "dotenv";
+import {
+  Agent,
+  Runner,
+  run,
+  tool,
+  setDefaultOpenAIClient,
+  setOpenAIAPI,
+  setTracingDisabled,
+  OpenAIProvider,
+} from "@openai/agents";
 import { z } from "zod";
-import { chromium } from 'playwright';
+import puppeteer from "puppeteer";
+import fs from "fs";
+import { OpenAI } from "openai";
 
-let browser = null;
-let page = null;
+dotenv.config();
 
-// =============== TOOLS =================
+// Small util: delay
+const pause = (ms) => new Promise((res) => setTimeout(res, ms));
 
-const takeScreenshot = tool({
+// ====== Puppeteer Setup ======
+const browserInstance = await puppeteer.launch({
+  headless: false,
+  args: ["--start-maximized", "--disable-extensions", "--disable-file-system"],
+  defaultViewport: null,
+});
+const activePage = await browserInstance.newPage();
+
+// ====== OpenAI Setup ======
+const aiClient = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+const provider = new OpenAIProvider({ openAIClient: aiClient });
+
+setDefaultOpenAIClient(aiClient);
+setOpenAIAPI("chat_completions");
+setTracingDisabled(true);
+
+// ====== TOOLS ======
+
+const screenshotTool = tool({
   name: "take_screenshot",
-  description: "Takes screenshot of current page",
+  description: "Captures current browser window",
   parameters: z.object({}),
   async execute() {
-    if (!page) throw new Error("No page open yet");
-    const screenshot = await page.screenshot({ encoding: "base64" });
-    return `data:image/png;base64,${screenshot}`;
-  }
+    const img = await activePage.screenshot();
+    const file = `snapshot-${Date.now()}.png`;
+    await fs.promises.writeFile(file, img);
+    return { file };
+  },
 });
 
-const closeBrowser = tool({
-  name: "close_browser",
-  description: "Closes the current browser instance",
-  parameters: z.object({}),
-  async execute() {
-    if (browser) {
-      await browser.close();
-      browser = null;
-      page = null;
-      return "Browser closed successfully";
-    } else {
-      return "No browser was open";
-      }
-  }
-  });
-
-const openBrowser = tool({
-  name: "open_browser",
-  description: "Opens a Chromium browser instance",
-  parameters: z.object({}),
-  async execute() {
-    if (browser) {
-      return "Browser is already open";
-    }
-    browser = await chromium.launch({ headless: false });
-    page = await browser.newPage();
-    return "Browser opened successfully";
-  }
-});
-
-const openUrl = tool({
+const navigateTool = tool({
   name: "open_url",
-  description: "Opens a URL in the current browser tab",
-  parameters: z.object({
-    url: z.string(),
-    waitFor: z.number()
-  }),
-  async execute({ url, waitFor }) {
-    if (!page) throw new Error("No browser open yet");
-    await page.goto(url);
-    if (waitFor) await page.waitForTimeout(waitFor);
-    return `Opened ${url} successfully`;
-  }
+  description: "Navigate to any given URL",
+  parameters: z.object({ url: z.string() }),
+  async execute({ url }) {
+    await activePage.goto(url, { waitUntil: "networkidle2" });
+    await pause(2000);
+    return { status: "ok", url };
+  },
 });
 
-const getElements = tool({
-  name: "get_elements",
-  description: "Lists elements with text and possible selectors",
-  parameters: z.object({}), 
-  async execute() {
-    if (!page) throw new Error("No page opened yet");
-    return await page.evaluate(() => {
-      return [...document.querySelectorAll("button, input, a")].map(el => ({
-        text: el.innerText,
-        tag: el.tagName,
-        id: el.id,
-        classes: el.className
-      }));
-    });
-  }
+const domExplorer = tool({
+  name: "page_structure",
+  description: "Extract important elements: forms, inputs, buttons",
+  parameters: z.object({ scope: z.string().nullable().default("form") }),
+  async execute({ scope = "form" }) {
+    const snapshot = await activePage.evaluate((scope) => {
+      const result = [];
+
+      // forms
+      document.querySelectorAll("form").forEach((f, idx) => {
+        result.push({
+          type: "form",
+          selector: `form:nth-of-type(${idx + 1})`,
+          id: f.id,
+          class: f.className,
+          action: f.action,
+        });
+      });
+
+      // inputs
+      document.querySelectorAll("input, textarea, select").forEach((el) => {
+        const opts = [];
+        if (el.id) opts.push(`#${el.id}`);
+        if (el.name) opts.push(`[name="${el.name}"]`);
+        if (el.type) opts.push(`input[type="${el.type}"]`);
+        if (el.placeholder) opts.push(`[placeholder="${el.placeholder}"]`);
+
+        result.push({
+          type: el.tagName.toLowerCase(),
+          inputType: el.type,
+          id: el.id,
+          name: el.name,
+          class: el.className,
+          placeholder: el.placeholder,
+          selectors: opts,
+          required: el.required,
+        });
+      });
+
+      // buttons
+      document.querySelectorAll("button, input[type='submit'], input[type='button']").forEach((btn) => {
+        const opts = [];
+        if (btn.id) opts.push(`#${btn.id}`);
+        if (btn.className) opts.push("." + btn.className.split(" ").join("."));
+        if (btn.type) opts.push(`[type="${btn.type}"]`);
+
+        result.push({
+          type: "button",
+          id: btn.id,
+          class: btn.className,
+          text: btn.textContent?.trim(),
+          selectors: opts,
+        });
+      });
+
+      return result;
+    }, scope);
+
+    return { snapshot };
+  },
 });
 
-const clickElement = tool({
-  name: "click_element",
-  description: "Click on an element using selector or coordinates",
+const inputWriter = tool({
+  name: "fill_input",
+  description: "Fill an input with fallback selectors",
   parameters: z.object({
-    selector: z.string(),
-    x: z.number(),
-    y: z.number()
+    selectors: z.array(z.string()),
+    value: z.string(),
   }),
-  async execute({ selector, x, y }) {
-    if (!page) throw new Error("No page opened yet");
-    if (selector) {
-      await page.click(selector);
-      return `Clicked on ${selector}`;
-    } else if (x && y) {
-      await page.mouse.click(x, y);
-      return `Clicked at (${x}, ${y})`;
-    } else {
-      throw new Error("Provide either selector or x,y");
+  async execute({ selectors, value }) {
+    for (const sel of selectors) {
+      try {
+        await activePage.waitForSelector(sel, { visible: true, timeout: 4000 });
+        await activePage.click(sel, { clickCount: 3 });
+        await pause(200);
+        await activePage.type(sel, value, { delay: 90 });
+        return { success: true, selector: sel };
+      } catch (err) {
+        continue;
+      }
     }
-  }
+    throw new Error(`Failed to fill input using: ${selectors}`);
+  },
 });
 
-const sendKeys = tool({
-  name: "send_keys",
-  description: "Types given keys on the page",
-  parameters: z.object({
-    keys: z.string()
-  }),
-  async execute({ keys }) {
-    if (!page) throw new Error("No page opened yet");
-    await page.keyboard.type(keys);
-    return `Sent keys: ${keys}`;
-  }
-});
-
-const doubleClick = tool({
-  name: "double_click",
-  description: "Double clicks on screen at given coordinates",
-  parameters: z.object({ x: z.number(), y: z.number() }),
-  async execute({ x, y }) {
-    if (!page) throw new Error("No page opened yet");
-    await page.mouse.move(x, y);
-    await page.mouse.dblclick(x, y);
-    return `Double clicked at (${x}, ${y})`;
-  }
-});
-
-const scroll = tool({
-  name: "scroll",
-  description: "Scrolls the page by a given amount",
-  parameters: z.object({ x: z.number(), y: z.number() }),
-  async execute({ x, y }) {
-    if (!page) throw new Error("No page opened yet");
-    await page.mouse.wheel(x, y);
-    return `Scrolled by (${x}, ${y})`;
-  }
-});
-
-const fillForm = tool({
-  name: "fill_form",
-  description: "Fills an input field by selector with given text",
-  parameters: z.object({
-    selector: z.string(),
-    value: z.string()
-  }),
-  async execute({ selector, value }) {
-    if (!page) throw new Error("No page opened yet");
-    await page.fill(selector, value);
-    return `Filled ${selector} with ${value}`;
-  }
-});
-
-const fillInputByLabel = tool({
-  name: "fill_input_by_label",
-  description: "Finds an input field by its label/placeholder and fills it with given value",
-  parameters: z.object({
-    label: z.string(),
-    value: z.string()
-  }),
-  async execute({ label, value }) {
-    if (!page) throw new Error("No page open yet");
-
-    let input = page.getByLabel(label);
-    if (await input.count() === 0) {
-      input = page.getByPlaceholder(label);
+const clicker = tool({
+  name: "click_item",
+  description: "Click element using fallback selectors",
+  parameters: z.object({ selectors: z.array(z.string()) }),
+  async execute({ selectors }) {
+    for (const sel of selectors) {
+      try {
+        await activePage.waitForSelector(sel, { visible: true, timeout: 4000 });
+        await activePage.click(sel);
+        return { success: true, selector: sel };
+      } catch (err) {
+        continue;
+      }
     }
-    if (await input.count() === 0) {
-      throw new Error(`Input field with label/placeholder "${label}" not found`);
-    }
-
-    await input.first().fill(value);
-    return `Filled ${label} with ${value}`;
-  }
+    throw new Error(`Failed to click using: ${selectors}`);
+  },
 });
 
-const clickButtonByText = tool({
-  name: "click_button_by_text",
-  description: "Clicks a button using its visible text",
-  parameters: z.object({
-    text: z.string()
-  }),
-  async execute({ text }) {
-    if (!page) throw new Error("No page open yet");
+// ====== Agent Setup ======
+const webAgent = new Agent({
+  name:"automationagnet",
+ instructions: `
+You are a **DOM-based website automation agent**.  
+Your job is to automate web interactions step by step using the provided tools.  
+Always inspect and rely on the DOM structure before performing any action.  
 
-    const button = page.getByRole("button", { name: text });
-    if (await button.count() === 0) {
-      throw new Error(`Button with text "${text}" not found`);
-    }
+---
 
-    await button.first().click();
-    return `Clicked button with text "${text}"`;
-  }
-});
+## Workflow Rules:
 
+1. **Start Browser**
+   - If no browser is open, always call \`open_browser\`.
 
+2. **Open Target URL**
+   - Use \`open_url\` with the given website link.
+   - If \`waitFor\` is provided, wait that many milliseconds after navigation.
 
-const pageStructure = tool({
-  name:"page_strcucture",
-  description:"To get the DOm structure of teh current page ,focusing on the elements that are requested by the user on the query",
-  parameters:z.object({}),
-})
+3. **Inspect Page**
+   - Use \`page_strcucture\` to extract DOM details (forms, inputs, buttons).
+   - From the structure, generate multiple reliable CSS selectors for each target element.
+   - Selector priority order:
+     1. \`#id\`
+     2. \`[name="..."]\`
+     3. \`[placeholder*="..."]\`
+     4. \`input[type="..."]\`
+     5. \`.className\`
 
-// =============== AGENT =================
+4. **Take Screenshot**
+   - After each major action (open page, fill input, click button), call \`take_screenshot\` to confirm progress.
 
-const websiteExecutionAgent = new Agent({
-  name: "website automation agent",
-  tools: [
-    takeScreenshot, openUrl, clickElement, getElements, sendKeys,
-    doubleClick, scroll, openBrowser, closeBrowser,
-    fillForm, fillInputByLabel, clickButtonByText
-  ],
+5. **Form Filling**
+   - For each input field:
+     - Gather multiple selector options from \`page_strcucture\`.
+     - Use \`fill_input\` with \`{ selectors: [...], value: "..." }\`.
+   - After filling, always confirm with \`take_screenshot\`.
+
+6. **Click Buttons / Links**
+   - For navigation or submission, use \`click_element\` with multiple selector options.
+   - If text is available, you may also use \`click_button_by_text\`.
+
+7. **Error Handling**
+   - If one selector fails, the tool will try the next.
+   - If all fail, re-run \`page_strcucture\` (DOM may have changed).
+
+8. **Completion**
+   - After final action (e.g., form submission), take a last screenshot.
+   - Then call \`close_browser\`.
+   - Provide a clear step-by-step action log as the final output.
+
+---
+
+## Example Strategy:
+Task: "Go to signup page and fill form"
+
+1. \`open_browser\`
+2. \`open_url("https://ui.chaicode.com/", waitFor: 2000)\`
+3. \`page_strcucture("button")\` → find Authentication button
+4. \`click_element(["#authBtn", ".auth-btn", "button:has-text('Authentication')"])\`
+5. \`page_strcucture("form")\` → extract input fields
+6. \`fill_input({ selectors: ["#email", "[name='email']", "[placeholder*='email']"], value: "test@example.com" })\`
+7. \`fill_input({ selectors: ["#password", "[name='password']", "input[type='password']"], value: "password123" })\`
+8. \`click_element(["#signupBtn", ".btn-signup", "button:has-text('Sign Up')"])\`
+9. \`take_screenshot\`
+10. \`close_browser\`
+`,
+  tools: [screenshotTool, navigateTool, domExplorer, inputWriter, clicker],
   model: "gpt-4o-mini",
-
-  instructions: `
-You are an agent that automates interactions with websites step by step.
-Follow these rules strictly:
-
-1. Always start by opening a browser using 'open_browser'.
-2. After every action, call 'take_screenshot' and analyze the current webpage state before deciding the next step.
-3. Navigate to the given URL using 'open_url'.
-4. For interacting with elements (forms, buttons, links):
-   - Prefer semantic tools like 'fill_form', 'fill_input_by_label', or 'click_button_by_text' if possible.
-   - If not possible, fallback to 'click_element' (using selector or coordinates).
-   - If typing text directly, use 'send_keys'.
-5. If coordinates or element locations are unclear, rely on the screenshot to analyze and identify the correct element.
-6. If an action fails or doesn't align with the goal, backtrack (retry or choose another selector) and try again.
-7. For filling forms:
-   - Use the keys/values provided by the user.
-   - If some values are missing, generate reasonable placeholders (e.g., random emails, dummy names).
-8. Always validate progress using the screenshot before proceeding to the next step.
-9. Once the final task is complete, close the browser using 'close_browser'.
-10. At the end, return step-by-step logs of actions performed.
-  `
 });
 
-// =============== EXECUTION =================
-
-async function chatwithagent(query) {
-  const result = await run(websiteExecutionAgent, query);
-  console.log(`History`, result.history);
-  console.log(result.finalOutput);
+// ====== Runner ======
+async function talkToAgent(task) {
+  const runner = new Runner({ modelProvider: provider });
+  try {
+    const result = await runner.run(webAgent, task, { maxTurns: 20 });
+    console.log("Final Log:", result.finalOutput);
+    await browserInstance.close();
+  } catch (err) {
+    console.error("Agent failed:", err);
+    await browserInstance.close();
+  }
 }
 
-chatwithagent("Open youtube.com and search chai aur code and play the first video");
+talkToAgent(`
+Go to https://ui.chaicode.com
+and complete the signup form in authentication  with:
+- First: Uday Krishna,
+- Last: Uday,
+- Email: abc@gmail.com,
+- Password: 12345@Test,
+- Confirm Password: 12345@Test,
+Finally, press the "Create Account" button.
+
+plz fill in teh correct details dont hurry the process
+`);
