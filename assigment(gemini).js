@@ -22,6 +22,7 @@ const wait = (ms) => new Promise((res) => setTimeout(res, ms));
 const browser = await puppeteer.launch({
   headless: false,
   args: ["--start-maximized", "--disable-extensions"],
+  executablePath: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   defaultViewport: null,
 });
 const page = await browser.newPage();

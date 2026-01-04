@@ -1,235 +1,235 @@
 import dotenv from "dotenv";
+import puppeteer from "puppeteer";
+import fs from "fs";
+import { z } from "zod";
 import {
   Agent,
   Runner,
-  run,
   tool,
   setDefaultOpenAIClient,
   setOpenAIAPI,
   setTracingDisabled,
   OpenAIProvider,
 } from "@openai/agents";
-import { z } from "zod";
-import puppeteer from "puppeteer";
-import fs from "fs";
 import { OpenAI } from "openai";
 
 dotenv.config();
 
-// Small util: delay
-const pause = (ms) => new Promise((res) => setTimeout(res, ms));
+// Small sleep util
+const wait = (ms) => new Promise((res) => setTimeout(res, ms));
 
-// ====== Puppeteer Setup ======
-const browserInstance = await puppeteer.launch({
+// Launch browser
+const browser = await puppeteer.launch({
   headless: false,
-  args: ["--start-maximized", "--disable-extensions", "--disable-file-system"],
+  args: ["--start-maximized", "--disable-extensions"],
   defaultViewport: null,
 });
-const activePage = await browserInstance.newPage();
+const page = await browser.newPage();
 
-// ====== OpenAI Setup ======
-const aiClient = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+// OpenAI Client
+const client = new OpenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+  baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
 });
-const provider = new OpenAIProvider({ openAIClient: aiClient });
 
-setDefaultOpenAIClient(aiClient);
+const provider = new OpenAIProvider({ openAIClient: client });
+setDefaultOpenAIClient(client);
 setOpenAIAPI("chat_completions");
 setTracingDisabled(true);
 
-// ====== TOOLS ======
+/* ----------------- TOOLS ------------------ */
 
-const screenshotTool = tool({
-  name: "take_screenshot",
-  description: "Captures current browser window",
+// Screenshot Tool
+const capturePage = tool({
+  name: "capture_page",
+  description: "Capture the current page screenshot as proof of action",
   parameters: z.object({}),
   async execute() {
-    const img = await activePage.screenshot();
-    const file = `snapshot-${Date.now()}.png`;
-    await fs.promises.writeFile(file, img);
-    return { file };
+    const buffer = await page.screenshot();
+    const path = `snap-${Date.now()}.png`;
+    await fs.promises.writeFile(path, buffer);
+    return { path };
   },
 });
 
-const navigateTool = tool({
-  name: "open_url",
-  description: "Navigate to any given URL",
-  parameters: z.object({ url: z.string() }),
-  async execute({ url }) {
-    await activePage.goto(url, { waitUntil: "networkidle2" });
-    await pause(2000);
-    return { status: "ok", url };
+// Open URL Tool
+const navigateTo = tool({
+  name: "navigate_to",
+  description: "Navigate browser to a specific link",
+  parameters: z.object({ link: z.string() }),
+  async execute({ link }) {
+    await page.goto(link, { waitUntil: "networkidle2" });
+    await wait(2000);
+    console.log("Page loaded:", link);
+    return { done: true };
   },
 });
 
-const domExplorer = tool({
-  name: "page_structure",
-  description: "Extract important elements: forms, inputs, buttons",
-  parameters: z.object({ scope: z.string().nullable().default("form") }),
-  async execute({ scope = "form" }) {
-    const snapshot = await activePage.evaluate((scope) => {
-      const result = [];
+// DOM Reader Tool
+const inspectDOM = tool({
+  name: "inspect_dom",
+  description: "Read form fields, buttons and inputs on the current page",
+  parameters: z.object({
+    area: z.string().optional().default("form"),
+  }),
+  async execute({ area }) {
+    const domInfo = await page.evaluate((focus) => {
+      const nodes = [];
 
-      // forms
-      document.querySelectorAll("form").forEach((f, idx) => {
-        result.push({
-          type: "form",
-          selector: `form:nth-of-type(${idx + 1})`,
-          id: f.id,
-          class: f.className,
-          action: f.action,
+      // Collect forms
+      document.querySelectorAll("form").forEach((form, i) => {
+        nodes.push({
+          tag: "form",
+          idx: i,
+          selector: `form:nth-child(${i + 1})`,
+          id: form.id,
+          action: form.action,
         });
       });
 
-      // inputs
+      // Collect inputs
       document.querySelectorAll("input, textarea, select").forEach((el) => {
-        const opts = [];
-        if (el.id) opts.push(`#${el.id}`);
-        if (el.name) opts.push(`[name="${el.name}"]`);
-        if (el.type) opts.push(`input[type="${el.type}"]`);
-        if (el.placeholder) opts.push(`[placeholder="${el.placeholder}"]`);
+        const s = [];
+        if (el.id) s.push(`#${el.id}`);
+        if (el.name) s.push(`[name="${el.name}"]`);
+        if (el.placeholder) s.push(`[placeholder="${el.placeholder}"]`);
+        if (el.type) s.push(`input[type="${el.type}"]`);
 
-        result.push({
-          type: el.tagName.toLowerCase(),
-          inputType: el.type,
+        nodes.push({
+          tag: el.tagName.toLowerCase(),
+          type: el.type,
           id: el.id,
           name: el.name,
-          class: el.className,
           placeholder: el.placeholder,
-          selectors: opts,
-          required: el.required,
+          selectors: s,
+          visible: el.offsetParent !== null,
         });
       });
 
-      // buttons
-      document.querySelectorAll("button, input[type='submit'], input[type='button']").forEach((btn) => {
-        const opts = [];
-        if (btn.id) opts.push(`#${btn.id}`);
-        if (btn.className) opts.push("." + btn.className.split(" ").join("."));
-        if (btn.type) opts.push(`[type="${btn.type}"]`);
+      // Collect buttons
+      document.querySelectorAll("button, input[type='submit']").forEach((btn) => {
+        const s = [];
+        if (btn.id) s.push(`#${btn.id}`);
+        if (btn.className) s.push("." + btn.className.split(" ").join("."));
+        if (btn.type) s.push(`[type="${btn.type}"]`);
 
-        result.push({
-          type: "button",
+        nodes.push({
+          tag: btn.tagName.toLowerCase(),
+          type: btn.type,
           id: btn.id,
-          class: btn.className,
           text: btn.textContent?.trim(),
-          selectors: opts,
+          selectors: s,
+          visible: btn.offsetParent !== null,
         });
       });
 
-      return result;
-    }, scope);
-
-    return { snapshot };
+      return nodes;
+    }, area);
+    return { domInfo };
   },
 });
 
-const inputWriter = tool({
-  name: "fill_input",
-  description: "Fill an input with fallback selectors",
+// Input Filler
+const typeInto = tool({
+  name: "type_into",
+  description: "Enter a value inside an input field using multiple selectors fallback",
   parameters: z.object({
     selectors: z.array(z.string()),
-    value: z.string(),
+    text: z.string(),
   }),
-  async execute({ selectors, value }) {
+  async execute({ selectors, text }) {
+    let ok = false;
+    let errorMsg = null;
+
     for (const sel of selectors) {
       try {
-        await activePage.waitForSelector(sel, { visible: true, timeout: 4000 });
-        await activePage.click(sel, { clickCount: 3 });
-        await pause(200);
-        await activePage.type(sel, value, { delay: 90 });
-        return { success: true, selector: sel };
+        await page.waitForSelector(sel, { visible: true, timeout: 4000 });
+        await page.click(sel, { clickCount: 3 });
+        await wait(400);
+        await page.type(sel, text, { delay: 80 });
+        console.log(`Typed '${text}' into ${sel}`);
+        ok = true;
+        break;
       } catch (err) {
+        errorMsg = err.message;
         continue;
       }
     }
-    throw new Error(`Failed to fill input using: ${selectors}`);
+
+    if (!ok) throw new Error("Failed typing: " + errorMsg);
+    return { success: true };
   },
 });
 
-const clicker = tool({
-  name: "click_element",
-  description: "Click element using fallback selectors",
-  parameters: z.object({ selectors: z.array(z.string()) }),
+// Clicker
+const pressElement = tool({
+  name: "press_element",
+  description: "Click on button/element using selector fallback strategy",
+  parameters: z.object({
+    selectors: z.array(z.string()),
+  }),
   async execute({ selectors }) {
+    let ok = false;
+    let errorMsg = null;
+
     for (const sel of selectors) {
       try {
-        await activePage.waitForSelector(sel, { visible: true, timeout: 4000 });
-        await activePage.click(sel);
-        return { success: true, selector: sel };
+        await page.waitForSelector(sel, { visible: true, timeout: 4000 });
+        await page.click(sel);
+        console.log("Clicked:", sel);
+        ok = true;
+        break;
       } catch (err) {
+        errorMsg = err.message;
         continue;
       }
     }
-    throw new Error(`Failed to click using: ${selectors}`);
+
+    if (!ok) throw new Error("Failed clicking: " + errorMsg);
+    return { success: true };
   },
 });
 
-// ====== Agent Setup ======
-const webAgent = new Agent({
-  name: "automationagent",
+/* ----------------- AGENT ------------------ */
+
+const automationAgent = new Agent({
+  name: "Web AutoBot",
   instructions: `
-You are a **DOM-based website automation agent**.
-Your job is to navigate and interact with websites step by step using tools.
+You are a browser automation assistant.
+Follow this workflow carefully:
 
----
+1. Use **navigate_to** to open the target site.
+2. Then call **inspect_dom** to get input fields/buttons.
+3. Before typing or clicking, always prepare multiple selectors.
+4. After every action, run **capture_page** to save progress.
+5. Always confirm action success through screenshots.
 
-## Workflow Rules:
-
-1. **Open Target URL**
-   - Always begin with \`open_url\`.
-
-2. **Inspect Page**
-   - Use \`page_structure("button")\` to detect navigation buttons like "Authentication" or "Signup".
-   - Click the correct button using \`click_element\`.
-
-3. **Move to Signup**
-   - After clicking, again run \`page_structure("form")\`.
-   - Collect form fields (first name, last name, email, password, confirm password).
-
-4. **Form Filling**
-   - Use \`fill_input\` with multiple selectors for each field.
-   - Fill values provided by the user.
-
-5. **Submit**
-   - Identify "Create Account" / "Sign Up" button using \`page_structure("button")\`.
-   - Use \`click_element\` on it.
-
-6. **After Each Step**
-   - Run \`take_screenshot\` to confirm progress.
-
-7. **Completion**
-   - After submission, final screenshot and then stop.
-   - Provide step-by-step log.
+Selectors Priority: #id > [name] > [placeholder] > input[type] > .className
 `,
-  tools: [screenshotTool, navigateTool, domExplorer, inputWriter, clicker],
-  model: "gpt-4o-mini",
+  tools: [capturePage, navigateTo, inspectDOM, typeInto, pressElement],
+  model: "gemini-2.5-flash",
 });
 
-// ====== Runner ======
-async function talkToAgent(task) {
+/* ----------------- RUNNER ------------------ */
+
+async function runTask(query) {
   const runner = new Runner({ modelProvider: provider });
   try {
-    const result = await runner.run(webAgent, task, { maxTurns: 25 });
-    console.log("Final Log:", result.finalOutput);
-    await browserInstance.close();
+    const res = await runner.run(automationAgent, query, { maxTurns: 25 });
+    console.log("Automation completed:", res.finalOutput);
   } catch (err) {
-    console.error("Agent failed:", err);
-    await browserInstance.close();
+    console.error("Automation failed:", err);
+  } finally {
+    await browser.close();
   }
 }
 
-// ====== EXECUTION ======
-talkToAgent(`
-Go to https://ui.chaicode.com
-- On homepage, click the "Authentication" or "Signup" button.
-- Navigate to signup form.
-- Fill in:
-  - First Name: Uday Krishna
-  - Last Name: Uday
-  - Email: abc@gmail.com
-  - Password: 12345@Test
-  - Confirm Password: 12345@Test
-- Finally press the "Create Account" button.
-Make sure to take screenshot after each step.
+runTask(`
+Visit https://ui.chaicode.com/auth/signup and register with:
+- First: uday
+- Last: krishna
+- Email: uday.krishna@example.com
+- Password:fffghgg
+- Confirm:fffghgg
+Finally, hit the "Create Account" button.
 `);
